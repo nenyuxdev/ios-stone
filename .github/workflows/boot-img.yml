@@ -1,0 +1,130 @@
+name: boot-img
+
+# Packs the sunstone XNU boot image (v3, flashed to boot_a) from a kernel built by xnu.yml.
+#   ADT (tools/mkadt.py) -> SWEETXNU payload (tools/mkpayload.py) -> shim + boot image (shim/build.sh)
+# It does not compile the kernel: it takes the `xnu-kernel` artifact of an xnu.yml run.
+#   - dispatched by hand: xnu_run_id picks the run (empty = the latest successful xnu.yml run)
+#   - after every successful xnu.yml run on the default branch (workflow_run)
+# Not included: the GPU firmware blob (GPUFW, vendor file kept out of git) and the iPhone X /product
+# node (research/ipsw-x/d22ap.adt, Apple artifact kept out of git). Images from here are the plain
+# build; pack with tools/mkboot.sh locally when you need those.
+on:
+  workflow_dispatch:
+    inputs:
+      xnu_run_id:
+        description: xnu.yml run whose kernel to pack (empty = latest successful run)
+        default: ""
+      cmdline:
+        description: kernel boot args (empty = the default set in tools/mkboot.sh)
+        default: ""
+  workflow_run:
+    workflows: [xnu]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: boot-img-${{ github.event.workflow_run.id || inputs.xnu_run_id || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  pack:
+    # a failed xnu.yml run still uploads its build tree, so only pack successful builds
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # for workflow_run the default checkout is the default branch; pack with the tools
+          # of the commit that built the kernel
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu cpio
+          aarch64-linux-gnu-gcc --version | head -1
+          python3 --version
+
+      - name: Resolve xnu run
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RUN: ${{ inputs.xnu_run_id }}
+          EVENT_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          run=${INPUT_RUN:-${EVENT_RUN:-}}
+          if [ -z "$run" ]; then
+            run=$(gh run list -R "$GITHUB_REPOSITORY" -w xnu.yml -s success -L 1 --json databaseId -q '.[0].databaseId')
+          fi
+          if [ -z "$run" ] || [ "$run" = null ]; then
+            echo "no successful xnu.yml run found; dispatch xnu.yml first" >&2
+            exit 1
+          fi
+          echo "id=$run" >> "$GITHUB_OUTPUT"
+          echo "xnu run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run"
+
+      - name: Download kernel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ steps.run.outputs.id }}
+        run: |
+          set -euo pipefail
+          mkdir -p xnu/kernel
+          gh run download "$RUN" -R "$GITHUB_REPOSITORY" -n xnu-kernel -D xnu/kernel
+          ls -la xnu/kernel
+          n=$(find xnu/kernel -maxdepth 1 -type f -name 'kernel.*.sweet' | wc -l)
+          [ "$n" = 1 ] || { echo "expected exactly one kernel.*.sweet in the artifact, found $n" >&2; exit 1; }
+          k=$(find xnu/kernel -maxdepth 1 -type f -name 'kernel.*.sweet')
+          echo "KERNEL=$k" >> "$GITHUB_ENV"
+          if [ -f xnu/kernel/SHA256SUMS ]; then
+            name=$(basename "$k")
+            line=$(grep -E " \*?$name\$" xnu/kernel/SHA256SUMS || true)
+            [ -n "$line" ] || { echo "no checksum for $name in SHA256SUMS" >&2; exit 1; }
+            (cd xnu/kernel && printf '%s\n' "$line" | sha256sum -c -)
+          fi
+
+      - name: Pack boot image
+        env:
+          CMDLINE: ${{ inputs.cmdline }}
+        run: |
+          set -euo pipefail
+          # an empty CMDLINE falls back to mkboot.sh's default set
+          tools/mkboot.sh "$KERNEL" out/boot.img 2>&1 | tee mkboot.log
+          cp shim/out/shim-boot-v4.img out/boot-v4.img
+          (cd out && sha256sum boot.img boot-v4.img > SHA256SUMS)
+          cat out/SHA256SUMS
+
+      - name: Summary
+        if: always()
+        env:
+          RUN: ${{ steps.run.outputs.id }}
+        run: |
+          {
+            echo "### boot.img"
+            echo "- kernel from xnu run [$RUN](https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN), commit \`$(git rev-parse --short HEAD)\`"
+            echo '- `boot.img` is v3 for boot_a; `boot-v4.img` is the fallback if the ABL refuses v3'
+            if [ -f out/SHA256SUMS ]; then
+              echo '```'
+              cat out/SHA256SUMS
+              echo '```'
+            fi
+            if grep -q '^warning:' mkboot.log 2>/dev/null; then
+              echo '```'
+              grep '^warning:' mkboot.log
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-img-${{ steps.run.outputs.id }}
+          path: |
+            out/boot.img
+            out/boot-v4.img
+            out/SHA256SUMS
+          if-no-files-found: error
